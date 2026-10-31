@@ -9,7 +9,15 @@ from typing import Any, Iterable
 def _iso(value: Any) -> str:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, (int, float)):
+        ms = int(value)
+        if ms < 10_000_000_000:
+            ms *= 1000
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
     if isinstance(value, str) and value:
+        digits = value.strip()
+        if digits.isdigit():
+            return _iso(int(digits))
         return value
     return datetime.now(timezone.utc).isoformat()
 

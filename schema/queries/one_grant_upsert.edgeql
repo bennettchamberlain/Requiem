@@ -1,4 +1,5 @@
 # Idempotent grant pointer for the caller. Not a secret.
+# one_user_id is the Connect reference string, handed back unchanged.
 # variables: $one_user_id (str), $space_id (optional str), $platforms (array<str>)
 select (
   insert OneGrant {

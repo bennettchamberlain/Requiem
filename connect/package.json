@@ -6,7 +6,7 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-    "@withone/connect": "^0.18.0",
+    "@withone/connect": "^0.19.1",
     "dotenv": "^16.6.1"
   }
 }

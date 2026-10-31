@@ -184,6 +184,7 @@ class MaiaApp {
     ..post('/one/authorize', _oneProxy)
     ..get('/one/callback', _oneProxy)
     ..post('/one/callback', _oneProxy)
+    ..get('/one/done', _oneDone)
     ..post('/one/connect', _authed(_oneConnect))
     ..get('/one/grant', _authed(_oneGrantGet))
     ..put('/one/grant', _authed(_oneGrantPut))
@@ -417,15 +418,26 @@ class MaiaApp {
       kind: b['kind'] as String? ?? 'note',
       title: b['title'] as String?,
       body: b['body'] as String?,
-      occurredAt: b['occurred_at'] == null
-          ? DateTime.now().toUtc()
-          : DateTime.parse(b['occurred_at'] as String),
+      occurredAt: _occurredAt(b['occurred_at']),
       source: b['source'] as String? ?? 'app',
       sourceId:
           b['source_id'] as String? ?? _digest('${b['title']}${b['body']}'),
     );
     final full = await c.querySingleJSON(queries['memory_get'], {'id': id});
     return Response.ok(full, headers: _jsonHeaders);
+  }
+
+  DateTime _occurredAt(Object? raw) {
+    if (raw is String && raw.isNotEmpty) {
+      final parsed = DateTime.tryParse(raw);
+      if (parsed != null) return parsed.toUtc();
+      final n = int.tryParse(raw);
+      if (n != null) {
+        final ms = n > 10000000000 ? n : n * 1000;
+        return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+      }
+    }
+    return DateTime.now().toUtc();
   }
 
   /// Insert-or-update, then embed inline when Ollama is configured (so search
@@ -849,6 +861,10 @@ class MaiaApp {
         ? await _oneAccountView(c, personId, grant!)
         : const <Map<String, dynamic>>[];
     final youOn = box.webAvailable;
+    final accountCount = accounts.length;
+    final accountLabel = accountCount == 1
+        ? '1 account connected'
+        : '$accountCount accounts connected';
     return _json({
       'default_provider': defaultChatLabel,
       'providers': {
@@ -881,10 +897,10 @@ class MaiaApp {
           'connected': oneLive,
           'ready': oneReady,
           'platforms': [
-            for (final account in accounts)
-              if (account['syncing'] == true) account['platform'],
+            for (final account in accounts) account['platform'],
           ],
           'accounts': accounts,
+          'account_count': accountCount,
           'connected_at': oneLive ? grant!['connected_at'] : null,
           'authorize_url': personId == null
               ? null
@@ -894,8 +910,9 @@ class MaiaApp {
                     'app.withone.ai/developers/connect and set ONE_CLIENT_ID '
                     'and ONE_CONNECT_KEY. Nothing is linked until you sign in there.'
               : oneLive
-              ? 'Each account comes from your One grant. Disconnect one '
-                    'without dropping the others, or add any platform One supports.'
+              ? '$accountLabel. One keeps the login. '
+                    'The grant stays until you revoke it, so Maia does not '
+                    'refresh a token. Each pull is checked against that grant.'
               : 'Sign in with One, then connect Slack, Linear, Gmail, or any '
                     'other app. Maia only lists accounts you actually grant.',
         },
@@ -1452,6 +1469,10 @@ class MaiaApp {
         );
       final res = await req.send().timeout(const Duration(seconds: 30));
       final bytes = await res.stream.toBytes();
+      final cookies = [
+        for (final cookie in res.headersSplitValues('set-cookie') ?? const <String>[])
+          cookie.replaceAll('Path=/api/one', 'Path=/one'),
+      ];
       return Response(
         res.statusCode,
         body: bytes,
@@ -1460,6 +1481,7 @@ class MaiaApp {
             'content-type': res.headers['content-type']!,
           if (res.headers['location'] != null)
             'location': res.headers['location']!,
+          if (cookies.isNotEmpty) 'set-cookie': cookies,
         },
       );
     } on Object catch (e) {
@@ -1530,18 +1552,17 @@ class MaiaApp {
     final personId = await _personId(c);
     if (personId == null) return _error(401, 'unauthorized', 'no person');
     final b = await _body(r);
-    final userId = b['one_user_id'] as String?;
-    if (userId == null || userId.isEmpty) {
+    final userId = _connectReference(b);
+    if (userId == null) {
       return _error(400, 'bad_request', 'one_user_id required');
     }
     final platforms = (b['platforms'] as List<dynamic>? ?? const [])
         .map((e) => e.toString())
         .toList();
-    final json = await c.querySingleJSON(queries['one_grant_upsert'], {
-      'one_user_id': userId,
-      'space_id': b['space_id'],
-      'platforms': platforms,
-    });
+    final json = await c.querySingleJSON(
+      queries['one_grant_upsert'],
+      _grantArgs(b, userId: userId, platforms: platforms),
+    );
     await _enqueueEtl(c, personId, platforms);
     return Response.ok(json, headers: _jsonHeaders);
   }
@@ -1562,19 +1583,23 @@ class MaiaApp {
         await _body(r);
     if (b['revoked'] == true) return _oneGrantDelete(r, c);
     if (b['lookup'] == true) return _oneGrantGet(r, c);
-    final userId = b['one_user_id'] as String?;
-    if (userId == null || userId.isEmpty) {
+    final userId = _connectReference(b);
+    if (userId == null) {
       return _error(400, 'bad_request', 'one_user_id required');
     }
-    final platforms = (b['platforms'] as List<dynamic>? ?? const [])
-        .map((e) => e.toString())
-        .toList();
+    final platforms = b.containsKey('platforms')
+        ? (b['platforms'] as List<dynamic>? ?? const [])
+            .map((e) => e.toString())
+            .toList()
+        : _platformList((await _grantMap(c))?['platforms']);
     final personId = b['person_id'] as String?;
-    final json = await c.querySingleJSON(queries['one_grant_upsert'], {
-      'one_user_id': userId,
-      'space_id': b['space_id'],
-      'platforms': platforms,
-    });
+    final json = await c.querySingleJSON(
+      queries['one_grant_upsert'],
+      _grantArgs(b, userId: userId, platforms: platforms),
+    );
+    if (b.containsKey('connections')) {
+      await _rememberPlatformGrants(c, b['connections']);
+    }
     if (personId != null && platforms.isNotEmpty) {
       await _enqueueEtl(c, personId, platforms);
     }
@@ -1658,6 +1683,13 @@ class MaiaApp {
     final ignored = await _ignoredPlatforms(c);
     final live = await _liveOneAccounts(personId);
     if (live == null) {
+      final stored = await _storedGrants(c);
+      if (stored.isNotEmpty) {
+        return [
+          for (final row in stored)
+            if (!ignored.contains(row['platform'])) {...row, 'syncing': true},
+        ];
+      }
       return [
         for (final platform in _platformList(grant['platforms']))
           if (!ignored.contains(platform))
@@ -1669,7 +1701,9 @@ class MaiaApp {
         {
           'platform': row['platform'],
           'name': row['name'] ?? row['platform'],
-          'access': row['access'] ?? '',
+          'access': row['access'] is Map
+              ? (row['access']['policy'] ?? '').toString()
+              : (row['access'] ?? '').toString(),
           'syncing': !ignored.contains(row['platform']),
         },
     ];
@@ -1696,6 +1730,44 @@ class MaiaApp {
     if (raw == 'null') return null;
     final decoded = jsonDecode(raw);
     return decoded is Map<String, dynamic> ? decoded : null;
+  }
+
+  Future<List<Map<String, dynamic>>> _storedGrants(gel.Client c) async {
+    final decoded = jsonDecode(await c.queryJSON(queries['sync_cursor_list']));
+    if (decoded is! List) return const [];
+    return [
+      for (final row in decoded)
+        if (row is Map && row['endpoint'] == 'grant')
+          ..._grantAccount(row),
+    ];
+  }
+
+  List<Map<String, dynamic>> _grantAccount(Map<dynamic, dynamic> row) {
+    final platform = row['platform']?.toString() ?? '';
+    if (platform.isEmpty || platform == 'one') return const [];
+    final cursor = _jsonMap(row['cursor']);
+    final access = cursor['access'];
+    return [
+      {
+        'platform': platform,
+        'name': (cursor['name'] ?? platform).toString(),
+        'access': access is Map
+            ? (access['policy'] ?? '').toString()
+            : (access ?? '').toString(),
+      },
+    ];
+  }
+
+  Map<String, dynamic> _jsonMap(Object? raw) {
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        return _jsonMap(jsonDecode(raw));
+      } on FormatException {
+        return const {};
+      }
+    }
+    if (raw is Map) return Map<String, dynamic>.from(raw);
+    return const {};
   }
 
   List<String> _platformList(Object? raw) => [
@@ -1741,16 +1813,84 @@ class MaiaApp {
     });
   }
 
+  String? _connectReference(Map<String, dynamic> source) {
+    final reference = source['reference'];
+    if (reference is String && reference.isNotEmpty) return reference;
+    final id = source['one_user_id'];
+    if (id is String && id.isNotEmpty) return id;
+    return null;
+  }
+
+  Map<String, dynamic> _grantArgs(
+    Map<String, dynamic> source, {
+    required String userId,
+    required List<String> platforms,
+  }) => {
+    'one_user_id': userId,
+    'space_id': source['space_id'],
+    'platforms': platforms,
+  };
+
+  /// One cursor per platform. The cursor holds the connection key and the
+  /// access the person granted. The OAuth token stays at One.
+  Future<void> _rememberPlatformGrants(gel.Client c, Object? raw) async {
+    final platforms = <String>[];
+    if (raw is List) {
+      for (final row in raw) {
+        if (row is! Map) continue;
+        final platform = row['platform']?.toString() ?? '';
+        if (platform.isEmpty) continue;
+        platforms.add(platform);
+        await c.querySingleJSON(queries['sync_cursor_upsert'], {
+          'platform': platform,
+          'endpoint': 'grant',
+          'cursor': jsonEncode({
+            'key': row['key'],
+            'name': row['name'] ?? platform,
+            'access': row['access'],
+          }),
+          'last_error': null,
+        });
+      }
+    }
+    await c.queryJSON(
+      r'''
+      delete SyncCursor
+      filter .owner = global current_person
+        and .endpoint = 'grant'
+        and .platform not in array_unpack(<array<str>>$platforms)
+      ''',
+      {'platforms': platforms},
+    );
+  }
+
+  Future<Response> _oneDone(Request r) async {
+    final failed = r.url.queryParameters['one_connect'] == 'error';
+    final title = failed ? 'One did not connect' : 'Maia has the grant';
+    final text = failed
+        ? 'That attempt did not finish. Go back to Maia and try the account again.'
+        : 'Each account you authorized is stored on this Maia. Close this tab and return to the app.';
+    return Response.ok(
+      '<!doctype html><meta charset="utf-8"><title>$title</title>'
+      '<body style="font:16px/1.4 system-ui;max-width:36rem;margin:3rem auto;padding:0 1rem">'
+      '<h1>$title</h1><p>$text</p></body>',
+      headers: const {'content-type': 'text/html; charset=utf-8'},
+    );
+  }
+
   Future<void> _saveGrantPlatforms(
     gel.Client c,
     Map<String, dynamic> grant,
     List<String> platforms,
   ) async {
-    await c.querySingleJSON(queries['one_grant_upsert'], {
-      'one_user_id': grant['one_user_id'],
-      'space_id': grant['space_id'],
-      'platforms': platforms,
-    });
+    await c.querySingleJSON(
+      queries['one_grant_upsert'],
+      _grantArgs(
+        grant,
+        userId: grant['one_user_id'] as String,
+        platforms: platforms,
+      ),
+    );
   }
 
   Future<List<Map<String, dynamic>>?> _liveOneAccounts(String personId) async {

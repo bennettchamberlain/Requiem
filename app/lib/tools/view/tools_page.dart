@@ -16,7 +16,7 @@ class ToolsPage extends StatefulWidget {
   State<ToolsPage> createState() => _ToolsPageState();
 }
 
-class _ToolsPageState extends State<ToolsPage> {
+class _ToolsPageState extends State<ToolsPage> with WidgetsBindingObserver {
   ChatCatalog? _catalog;
   String? _error;
   var _loading = true;
@@ -34,7 +34,19 @@ class _ToolsPageState extends State<ToolsPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _load();
   }
 
   Future<void> _load() async {
@@ -191,9 +203,22 @@ class _ToolsPageState extends State<ToolsPage> {
   }
 
   bool _connected(_Connector item) {
-    final account = _accountFor(item);
-    if (account != null) return account.syncing;
+    if (_accountFor(item) != null) return true;
     return _one?.platforms.contains(item.slug) ?? false;
+  }
+
+  _Connector _connectorFor(OneAccount account) {
+    for (final item in _connectors) {
+      if (item.slug == account.platform) return item;
+    }
+    return _Connector(
+      account.platform,
+      account.label,
+      'all',
+      'Granted through One.',
+      LucideIcons.link,
+      const Color(0xFF111111),
+    );
   }
 
   List<_Connector> get _visible {
@@ -208,12 +233,12 @@ class _ToolsPageState extends State<ToolsPage> {
     ];
   }
 
-  int get _connectedCount {
-    var n = 0;
-    for (final item in _connectors) {
-      if (_connected(item)) n++;
-    }
-    return n;
+  int get _connectedCount => _one?.accounts.length ?? 0;
+
+  String get _connectedLabel {
+    final n = _connectedCount;
+    if (n == 1) return '1 account connected';
+    return '$n accounts connected';
   }
 
   void _openDetail(_Connector item) {
@@ -235,21 +260,16 @@ class _ToolsPageState extends State<ToolsPage> {
   @override
   Widget build(BuildContext context) {
     final theme = ShadTheme.of(context);
-    final connected = _connectedCount;
     return Scaffold(
       body: Column(
         children: [
           MaiaHeader(
             title: 'Connectors',
             actions: [
-              if (connected > 0)
-                Padding(
-                  padding: const EdgeInsets.only(right: 4),
-                  child: Text(
-                    '$connected connected',
-                    style: theme.textTheme.muted,
-                  ),
-                ),
+              Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Text(_connectedLabel, style: theme.textTheme.small),
+              ),
               ShadIconButton.ghost(
                 key: const Key('tools_refresh_button'),
                 icon: const Icon(LucideIcons.refreshCw, size: 16),
@@ -293,6 +313,29 @@ class _ToolsPageState extends State<ToolsPage> {
                         ),
                       ),
                       const SizedBox(height: 20),
+                      Text(_connectedLabel, style: theme.textTheme.h4),
+                      const SizedBox(height: 4),
+                      Text(
+                        'One keeps the login. Maia stores the grant and '
+                        'pulls each account into memory.',
+                        style: theme.textTheme.muted,
+                      ),
+                      const SizedBox(height: 20),
+                      if (_query.isEmpty &&
+                          _category == 'all' &&
+                          _connectedCount > 0) ...[
+                        _SectionLabel('Connected'),
+                        const SizedBox(height: 8),
+                        for (final account in _one!.accounts)
+                          _ConnectorRow(
+                            item: _connectorFor(account),
+                            connected: true,
+                            busy: _busy,
+                            onConnect: () => _connect(account.platform),
+                            onOpen: () => _openDetail(_connectorFor(account)),
+                          ),
+                        const SizedBox(height: 16),
+                      ],
                       if (_query.isEmpty && _category == 'all') ...[
                         _SectionLabel('Recommended'),
                         const SizedBox(height: 8),
@@ -385,17 +428,9 @@ const _connectors = <_Connector>[
     'google-docs',
     'Google Docs',
     'productivity',
-    'Read, create, and edit documents.',
+    'Documents you grant.',
     LucideIcons.fileText,
     Color(0xFF4285F4),
-  ),
-  _Connector(
-    'email',
-    'Email',
-    'communication',
-    'Generic mailbox connector.',
-    LucideIcons.inbox,
-    Color(0xFFC2185B),
   ),
   _Connector(
     'github',
@@ -438,7 +473,7 @@ const _connectors = <_Connector>[
     Color(0xFF00C4CC),
   ),
   _Connector(
-    'onedrive',
+    'one-drive',
     'OneDrive',
     'files',
     'Files from Microsoft.',

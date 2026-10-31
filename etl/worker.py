@@ -71,8 +71,8 @@ def main() -> int:
 
 
 def _pull(platform: str, *, person_id: str) -> object:
-    connect = os.environ.get("CONNECT_URL", "").rstrip("/")
-    if connect and person_id:
+    connect = (os.environ.get("CONNECT_URL") or "http://127.0.0.1:8788").rstrip("/")
+    if person_id:
         intent, _task = INTENTS.get(platform, ("list recent records", ""))
         try:
             response = httpx.post(
@@ -80,17 +80,18 @@ def _pull(platform: str, *, person_id: str) -> object:
                 json={"person": person_id, "platform": platform, "intent": intent},
                 timeout=45,
             )
-        except httpx.HTTPError:
-            response = None
-        if response is not None and response.status_code == 200:
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"One Connect sidecar is not reachable at {connect}") from exc
+        if response.status_code == 200:
             return response.json()
-        if response is not None and response.status_code != 503:
-            detail = response.text
-            if response.headers.get("content-type", "").startswith("application/json"):
-                body = response.json()
-                if isinstance(body, dict) and body.get("error"):
-                    detail = str(body["error"])
-            raise RuntimeError(detail or f"One pull failed ({response.status_code})")
+        detail = response.text
+        if response.headers.get("content-type", "").startswith("application/json"):
+            body = response.json()
+            if isinstance(body, dict) and body.get("error"):
+                detail = str(body["error"])
+        if detail == "reconnect_required":
+            raise RuntimeError("One grant needs a reconnect")
+        raise RuntimeError(detail or f"One pull failed ({response.status_code})")
     fixture = os.environ.get("SCORIA_ETL_FIXTURE")
     if fixture:
         data = json.loads(Path(fixture).read_text())
